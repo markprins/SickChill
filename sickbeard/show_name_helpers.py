@@ -65,7 +65,7 @@ def containsAtLeastOneWord(name, words):
         return True
 
     for word, regexp in six.iteritems(
-        {word: re.compile(r'(^|[\W_]){0}($|[\W_])'.format(re.escape(word)), re.I) for word in words}
+        {word: re.compile(r'^.*{0}.*$'.format(re.escape(word)), re.I) for word in words}
     ):
         if regexp.search(name):
             return word
