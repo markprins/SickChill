@@ -26,12 +26,17 @@ import re
 import shutil
 import stat
 import threading
+import time
 import traceback
+from sqlite3 import OperationalError
 
 # Third Party Imports
-import six
-from imdb import imdb
+import babelfish
+# import guessit
+from imdbpie import Imdb, ImdbFacade
+from imdbpie.exceptions import ImdbAPIError
 from unidecode import unidecode
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 # First Party Imports
 import sickbeard
@@ -128,7 +133,7 @@ class TVShow(object):
     genre = property(lambda self: self._genre, dirty_setter("_genre"))
     classification = property(lambda self: self._classification, dirty_setter("_classification"))
     runtime = property(lambda self: self._runtime, dirty_setter("_runtime"))
-    imdb_info = property(lambda self: self._imdb_info, dirty_setter("_imdb_info"))
+    # imdb_info = property(lambda self: self._imdb_info, dirty_setter("_imdb_info"))
     quality = property(lambda self: self._quality, dirty_setter("_quality"))
     season_folders = property(lambda self: self._season_folders, dirty_setter("_season_folders"))
     status = property(lambda self: self._status, dirty_setter("_status"))
@@ -201,6 +206,14 @@ class TVShow(object):
 
     location = property(_getLocation, _setLocation)
 
+    def _get_imdb_info(self):
+        return self._imdb_info
+
+    def _set_imdb_info(self, imdb_info):
+        dirty_setter("_imdb_info")(self, imdb_info)
+
+    imdb_info = property(_get_imdb_info, _set_imdb_info)
+
     # delete references to anything that's not in the internal lists
     def flushEpisodes(self):
 
@@ -257,6 +270,9 @@ class TVShow(object):
         season = try_int(season, None)
         episode = try_int(episode, None)
         absolute_number = try_int(absolute_number, None)
+
+        if season in self.episodes and episode in self.episodes[season] and self.episodes[season][episode]:
+            return self.episodes[season][episode]
 
         # if we get an anime get the real season and episode
         if self.is_anime and absolute_number and not season and not episode:
@@ -713,7 +729,7 @@ class TVShow(object):
         if len(sql_results) > 1:
             raise MultipleShowsInDatabaseException()
         elif not sql_results:
-            logger.log(str(self.indexerid) + ": Unable to find the show in the database")
+            # logger.log(str(self.indexerid) + ": Unable to find the show in the database")
             return
         else:
             self.indexer = int(sql_results[0][b"indexer"] or 0)
@@ -788,7 +804,7 @@ class TVShow(object):
                 logger.log(str(self.indexerid) + ": Unable to find IMDb show info in the database")
                 return
 
-        self.imdb_info = dict(zip(sql_results[0].keys(), sql_results[0]))
+        self._imdb_info = dict(zip(sql_results[0].keys(), sql_results[0]))
         self.dirty = False
         return True
 
@@ -823,107 +839,73 @@ class TVShow(object):
         self.status = getattr(myShow, 'status', 'Unknown')
 
     def check_imdbid(self):
+        if not self.imdbid.startswith('tt'):
+            self.imdbid = 'tt' + self.imdbid
+
         try:
-            int(re.sub(r"[^0-9]", "", self.imdbid))
+            int(re.sub(r"[^0-9]", "", self.imdbid).lstrip('t'))
         except (ValueError, TypeError):
             self.imdbid = ""
 
     def loadIMDbInfo(self):
+        try:
+            # client = Imdb(session=helpers.make_indexer_session(), locale=sickbeard.GUI_LANG, exclude_episodes=True)
+            client = Imdb(session=helpers.make_indexer_session(), locale=sickbeard.GUI_LANG)
+            client._cachedir = sickbeard.CACHE_DIR
+            i = ImdbFacade(client=client)
 
-        imdb_info = {
-            'imdb_id': '',
-            'title': '',
-            'year': '',
-            'akas': [],
-            'runtimes': '',
-            'genres': [],
-            'countries': '',
-            'country_codes': [],
-            'certificates': [],
-            'rating': '',
-            'votes': '',
-            'last_update': ''
-        }
+            # Check that the imdbid we have is valid for searching
+            self.check_imdbid()
 
-        if sickbeard.PROXY_SETTING and sickbeard.PROXY_INDEXERS:
-            i = imdb.IMDb(proxy=sickbeard.PROXY_SETTING)
-        else:
-            i = imdb.IMDb()
+            if self.name and not self.imdbid:
+                for attempt in (self.name, '{} ({})'.format(self.name, self.startyear), '"{}" ({})'.format(self.name, self.startyear)):
+                    results = filter(lambda x: x.type == 'TV series' and x.title == attempt, i.search_for_title(attempt))
+                    if self.startyear:
+                        results = filter(lambda x: x.year == self.startyear, results)
+                    if len(results) == 1:
+                        self.imdbid = results[0].imdb_id
 
-        # Check that the imdbid we have is valid for searching
-        self.check_imdbid()
+                    if self.imdbid:
+                        break
 
-        if self.name and not self.imdbid:
-            self.imdbid = i.title2imdbID(self.name, kind='tv series')
+            # Make sure the lib didn't give us back something bogus
+            self.check_imdbid()
+
             if not self.imdbid:
-                self.imdbid = i.title2imdbID('{} ({})'.format(self.name, self.startyear), kind='tv series')
-            if not self.imdbid:
-                self.imdbid = i.title2imdbID('"{}" ({})'.format(self.name, self.startyear), kind='tv series')
+                logger.log(str(self.indexerid) + ": Not loading show info from IMDb, because we don't know the imdbid", logger.DEBUG)
+                return
 
-        # Make sure the lib didn't give us back something bogus
-        self.check_imdbid()
+            logger.log(str(self.indexerid) + ": Loading show info from IMDb", logger.DEBUG)
 
-        if not self.imdbid:
-            logger.log(str(self.indexerid) + ": Not loading show info from IMDb, because we don't know the imdbid", logger.DEBUG)
-            # Set to empty to avoid Keyerrors
-            self.imdb_info = imdb_info
-            return
+            imdb_title = i.get_title(self.imdbid)
 
-        logger.log(str(self.indexerid) + ": Loading show info from IMDb", logger.DEBUG)
+            title_versions = client.get_title_versions(self.imdbid)
 
-        imdbTv = i.get_movie(str(re.sub(r"[^0-9]", "", self.imdbid)))
+            # indexer_id, imdb_id, title, year, akas, runtimes, genres, countries, country_codes, certificates, rating, votes, last_update
 
-        imdb_info['imdb_id'] = self.imdbid
+            self.imdb_info = {
+                'indexer_id': self.indexerid,
+                'imdb_id': imdb_title.imdb_id or self.imdbid,
+                'title': imdb_title.title or self.name,
+                'year': imdb_title.year or self.startyear,
+                'akas': '|'.join(
+                    set('{} ({})'.format(alternate['title'], babelfish.COUNTRIES.get(alternate['region'], _('World Wide')).title())
+                        for alternate in title_versions['alternateTitles']
+                        if 'region' in alternate and 'title' in alternate and alternate['title'] != imdb_title.title)
+                ),
+                'runtimes': imdb_title.runtime or self.runtime,
+                'genres': '|'.join(imdb_title.genres or []),
+                'countries': '|'.join(babelfish.COUNTRIES[x].title() for x in title_versions.get('origins', [])),
+                'country_codes': '|'.join(title_versions.get('origins', [])).lower(),
+                'certificates': imdb_title.certification or '',
+                'rating': str(imdb_title.rating or 0.0),
+                'votes': imdb_title.rating_count or 0,
+                'last_update': datetime.date.today().toordinal()
+            }
 
-        for key in [x for x in imdb_info.keys() if x.replace('_', ' ') in imdbTv.keys()]:
-            # Store only the first value for string type
-            if isinstance(imdb_info[key], six.string_types) and isinstance(imdbTv.get(key.replace('_', ' ')), list):
-                imdb_info[key] = imdbTv.get(key.replace('_', ' '))[0]
-            else:
-                imdb_info[key] = imdbTv.get(key.replace('_', ' '))
-
-        # Filter only the value
-        if imdb_info['runtimes']:
-            imdb_info['runtimes'] = re.search(r'\d+', imdb_info['runtimes']).group(0)
-        else:
-            imdb_info['runtimes'] = self.runtime
-
-        if imdb_info['akas']:
-            imdb_info['akas'] = '|'.join(imdb_info['akas'])
-        else:
-            imdb_info['akas'] = ''
-
-        # Join all genres in a string
-        if imdb_info['genres']:
-            imdb_info['genres'] = '|'.join(imdb_info['genres'])
-        else:
-            imdb_info['genres'] = ''
-
-        # Get only the production country certificate if any
-        if imdb_info['certificates'] and imdb_info['countries']:
-            dct = {}
-            try:
-                for item in imdb_info['certificates']:
-                    dct[item.split(':')[0]] = item.split(':')[1]
-
-                imdb_info['certificates'] = dct[imdb_info['countries']]
-            except Exception:
-                imdb_info['certificates'] = ''
-
-        else:
-            imdb_info['certificates'] = ''
-
-        if imdb_info['country_codes']:
-            imdb_info['country_codes'] = '|'.join(imdb_info['country_codes'])
-        else:
-            imdb_info['country_codes'] = ''
-
-        imdb_info['last_update'] = datetime.date.today().toordinal()
-
-        # Rename dict keys without spaces for DB upsert
-        self.imdb_info = dict(
-            (k.replace(' ', '_'), k(v) if hasattr(v, 'keys') else v) for k, v in six.iteritems(imdb_info))
-        logger.log(str(self.indexerid) + ": Obtained info from IMDb ->" + str(self.imdb_info), logger.DEBUG)
+            logger.log(str(self.indexerid) + ": Obtained info from IMDb ->" + str(self.imdb_info), logger.DEBUG)
+        except (ValueError, LookupError, OperationalError, ImdbAPIError, NewConnectionError, MaxRetryError) as e:
+            logger.log('Could not get IMDB info: {}'. format(e))
 
     def nextEpisode(self):
         curDate = datetime.date.today().toordinal()
@@ -1025,6 +1007,8 @@ class TVShow(object):
 
         # make sure the show dir is where we think it is unless dirs are created on the fly
         if not ek(os.path.isdir, self._location) and not sickbeard.CREATE_MISSING_SHOW_DIRS:
+            logger.log('Show dir does not exist, and `create missing show dirs` is disabled. Skipping refresh (statuses will not be updated): {}'.format(
+                self._location))
             return False
 
         # load from dir
@@ -1053,13 +1037,13 @@ class TVShow(object):
 
             # if the path doesn't exist or if it's not in our show dir
             if not ek(os.path.isfile, curLoc) or not ek(os.path.normpath, curLoc).startswith(
-                    ek(os.path.normpath, self.location)):
+                    ek(os.path.normpath, self._location)):
 
                 # check if downloaded files still exist, update our data if this has changed
                 if not sickbeard.SKIP_REMOVED_FILES:
                     with curEp.lock:
                         # if it used to have a file associated with it and it doesn't anymore then set it to sickbeard.EP_DEFAULT_DELETED_STATUS
-                        if curEp.location and curEp.status in Quality.DOWNLOADED:
+                        if curEp.status in Quality.DOWNLOADED:
 
                             if sickbeard.EP_DEFAULT_DELETED_STATUS == ARCHIVED:
                                 oldStatus_, oldQuality = Quality.splitCompositeStatus(curEp.status)
@@ -1080,6 +1064,8 @@ class TVShow(object):
                         curEp.release_group = ''
 
                         sql_l.append(curEp.get_sql())
+                else:
+                    logger.log('Skipping updating removed file because `skip removed files` is enabled: {}'.format(curLoc))
 
         if sql_l:
             main_db_con = db.DBConnection()
@@ -1654,7 +1640,7 @@ class TVEpisode(object):
                         status=statusStrings[self.status], location=self.location), logger.DEBUG)
 
         if not ek(os.path.isfile, self.location):
-            if self.airdate >= datetime.date.today() or self.airdate == datetime.date.min:
+            if self.airdate >= datetime.date.today() or self.airdate <= datetime.date.min:
                 logger.log("{0}: Episode airs in the future or has no airdate, marking it {1}".format(self.show.indexerid, statusStrings[UNAIRED]), logger.DEBUG)
                 self.status = UNAIRED
             elif self.status in [UNAIRED, UNKNOWN]:
@@ -1793,6 +1779,7 @@ class TVEpisode(object):
 
         for cur_provider in sickbeard.metadata_provider_dict.values():
             result = cur_provider.create_episode_metadata(self) or result
+            result = cur_provider.update_episode_metadata(self) or result
 
         return result
 
@@ -2033,6 +2020,7 @@ class TVEpisode(object):
                 return ''
 
             try:
+                # guess_result = guessit.guessit(name, dict(single_value=True))
                 parse_result = NameParser(name, showObj=show, naming_pattern=True).parse(name)
             except (InvalidNameException, InvalidShowException) as error:
                 logger.log("Unable to get parse release_group: {0}".format(error), logger.DEBUG)
@@ -2040,6 +2028,8 @@ class TVEpisode(object):
 
             if not parse_result.release_group:
                 return ''
+
+            # return guess_result.get('release_group', '').strip('.- []{}')
             return parse_result.release_group.strip('.- []{}')
 
         epStatus_, epQual = Quality.splitCompositeStatus(self.status)  # @UnusedVariable
@@ -2482,8 +2472,6 @@ class TVEpisode(object):
             filemtime = datetime.datetime.fromtimestamp(ek(os.path.getmtime, self.location)).replace(tzinfo=network_timezones.sb_timezone)
 
             if filemtime != airdatetime:
-                import time
-
                 airdatetime = airdatetime.timetuple()
                 logger.log("{0}: About to modify date of '{1}' to show air date {2}".format
                            (self.show.indexerid, self.location, time.strftime("%b %d,%Y (%H:%M)", airdatetime)), logger.DEBUG)

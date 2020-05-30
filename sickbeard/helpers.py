@@ -58,11 +58,13 @@ import requests
 import six
 import urllib3
 from cachecontrol import CacheControl
+from cloudscraper.exceptions import CloudflareException
 from requests.compat import urljoin
 from requests.utils import urlparse
 # noinspection PyUnresolvedReferences
 from six.moves import urllib
 from tornado._locale_data import LOCALE_NAMES
+from unidecode import unidecode
 
 # First Party Imports
 import sickbeard
@@ -74,7 +76,8 @@ from sickchill.show.Show import Show
 
 # Local Folder Imports
 from . import classes, db, logger
-from .common import USER_AGENT
+
+# from .common import USER_AGENT
 
 # Add some missing languages
 LOCALE_NAMES.update({
@@ -1048,6 +1051,7 @@ def get_show(name, tryIndexers=False):
             sickbeard.name_cache.addNameToCache(name, showObj.indexerid)
     except Exception as error:
         logger.log(_("Error when attempting to find show: {0} in SickChill. Error: {1} ").format(name, error), logger.DEBUG)
+        logger.log(traceback.format_exc(), logger.DEBUG)
 
     return showObj
 
@@ -1251,13 +1255,27 @@ def touchFile(fname, atime=None):
     return False
 
 
+def make_indexer_session(use_cfscrape=True):
+    session = make_session(use_cfscrape)
+    session.verify = (False, certifi.where())[sickbeard.SSL_VERIFY]
+    if sickbeard.PROXY_SETTING and sickbeard.PROXY_INDEXERS:
+        logger.log(_("Using global proxy: {}").format(sickbeard.PROXY_SETTING), logger.DEBUG)
+        parsed_url = urlparse(sickbeard.PROXY_SETTING)
+        address = sickbeard.PROXY_SETTING if parsed_url.scheme else 'http://' + sickbeard.PROXY_SETTING
+        session.proxies = {
+            "http": address,
+            "https": address,
+        }
+    return session
+
+
 def make_session(use_cfscrape=True):
     if use_cfscrape and sys.version_info < (2, 7, 9):
         session = cfscrape.create_scraper()
     else:
         session = cloudscraper.create_scraper()
 
-    session.headers.update({'User-Agent': USER_AGENT, 'Accept-Encoding': 'gzip,deflate'})
+    # session.headers.update({'User-Agent': USER_AGENT, 'Accept-Encoding': 'gzip,deflate'})
 
     return CacheControl(sess=session, cache_etags=True)
 
@@ -1446,6 +1464,8 @@ def handle_requests_exception(requests_exception):
     except requests.exceptions.StreamConsumedError as error:
         logger.log(default.format(error, type(error.__class__.__name__)))
     except requests.exceptions.URLRequired as error:
+        logger.log(default.format(error, type(error.__class__.__name__)))
+    except CloudflareException as error:
         logger.log(default.format(error, type(error.__class__.__name__)))
     except (TypeError, ValueError) as error:
         level = get_level(error)
@@ -1756,7 +1776,7 @@ def remove_site_message(key=None, tag=None):
 def sortable_name(name):
     if not sickbeard.SORT_ARTICLE:
         name = re.sub(r'(?:The|A|An)\s', '', name, flags=re.I)
-    return name.lower()
+    return unidecode(name.lower())
 
 
 def manage_torrents_url(reset=False):
