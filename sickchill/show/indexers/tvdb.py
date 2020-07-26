@@ -45,8 +45,8 @@ class TVDB(Indexer):
         self.name = 'theTVDB'
         self.slug = 'tvdb'
         self.api_key = '6aa6e4ecae5b56e9644f6a303c0739b6'
-        self.show_url = 'http://thetvdb.com/?tab=series&id='
-        self.base_url = 'http://thetvdb.com/api/%(apikey)s/series/'
+        self.show_url = 'https://thetvdb.com/?tab=series&id='
+        self.base_url = 'https://thetvdb.com/api/%(apikey)s/series/'
         self.icon = 'images/indexers/thetvdb16.png'
         tvdbsimple.KEYS.API_KEY = self.api_key
         self._search = tvdbsimple.search.Search().series
@@ -188,7 +188,8 @@ class TVDB(Indexer):
         api_results = self.series_images(show.indexerid, lang or show.lang, keyType=keyType, subKey=subKey)
         images = getattr(api_results, keyType)(lang or show.lang)
         images = sorted(images, key=lambda img: img['ratingsInfo']['average'], reverse=True)
-        return self.complete_image_url(images[0][('fileName', 'thumbnail')[thumb]])
+        # return self.complete_image_url(images[0][('fileName', 'thumbnail')[thumb]])
+        return self.complete_image_url(images[0]['fileName'])
 
     @staticmethod
     @ExceptionDecorator()

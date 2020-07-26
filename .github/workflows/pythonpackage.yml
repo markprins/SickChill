@@ -25,6 +25,7 @@ jobs:
       with:
         fetch-depth: 1
         persist-credentials: false
+        ref: ${{ github.head_ref }}
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v1
       with:
@@ -38,7 +39,7 @@ jobs:
       run: |
         echo "::set-output name=dir::$(npm config get cache)"
     - name: Restore npm cache
-      uses: actions/cache@v1
+      uses: actions/cache@v2
       with:
         path: ${{ steps.npm-cache.outputs.dir }}
         key: ${{ runner.os }}-node-${{ hashFiles('**/package.json') }}
@@ -48,7 +49,7 @@ jobs:
       id: yarn-cache-dir-path
       run: echo "::set-output name=dir::$(yarn cache dir)"
     - name: Restore yarn cache
-      uses: actions/cache@v1
+      uses: actions/cache@v2
       id: yarn-cache
       with:
         path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
@@ -56,7 +57,7 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-yarn-
     - name: Restore pip cache
-      uses: actions/cache@v1
+      uses: actions/cache@v2
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
@@ -70,7 +71,7 @@ jobs:
       id: tox-workdir-path
       run: echo "::set-output name=dir::$(tox --showconfig | grep '^toxworkdir = .*$' | tail -c+14)"
     - name: Restore tox workdir
-      uses: actions/cache@v1
+      uses: actions/cache@v2
       with:
         path: ${{ steps.tox-workdir-path.outputs.dir }}
         key: ${{ runner.os }}-tox-${{ hashFiles('**/tox.ini') }}
@@ -91,12 +92,14 @@ jobs:
       with:
         fetch-depth: 1
         persist-credentials: false
+        ref: ${{ github.head_ref }}
     - name: Set up Docker Buildx
       if: success()
       id: buildx
-      uses: crazy-max/ghaction-docker-buildx@v1
+      uses: crazy-max/ghaction-docker-buildx@v3
       with:
-        version: latest
+        buildx-version: latest
+        qemu-version: latest
     - name: Available platforms
       if: success()
       run: echo ${{ steps.buildx.outputs.platforms }}
@@ -109,21 +112,26 @@ jobs:
         echo ::set-output name=docker_image::docker.io/${GITHUB_REPOSITORY,,}
         VERSION_TAG=${GITHUB_REF#refs/*/}
         echo ::set-output name=version::${VERSION_TAG%/merge}
-        echo ::set-output name=docker_cache::docker.io/miigotu/sickchill-cache
+    - name: Cache Docker layers
+      uses: actions/cache@v2
+      id: cache
+      with:
+        path: /tmp/.buildx-cache
+        key: ${{ runner.os }}-buildx-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-buildx-
     - name: Docker Login and set build command
       if: success()
       id: login
       env:
         DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        GITHUB_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
       run: |
         echo "${DOCKER_PASSWORD}" | docker login --username "${{ steps.prepare.outputs.docker_username }}" --password-stdin docker.io
         echo  "Available target: ${{ steps.buildx.outputs.platforms }}"
         echo ::set-output name=buildx::$(echo docker buildx build --output type=image,name=${{ steps.prepare.outputs.docker_image }},push=true \
-          --platform ${{ steps.prepare.outputs.docker_platforms }} \
-          --cache-to "type=registry,ref=${{ steps.prepare.outputs.docker_cache }}:${{ steps.prepare.outputs.version }}" \
-          --cache-from "type=registry,ref=${{ steps.prepare.outputs.docker_cache }}:${{ steps.prepare.outputs.version }},mode=max" \
+          --platform ${{ steps.prepare.outputs.docker_platforms }} --cache-from "type=local,src=/tmp/.buildx-cache" --cache-to "type=local,dest=/tmp/.buildx-cache" \
           --tag "${{ steps.prepare.outputs.docker_image }}:${{ steps.prepare.outputs.version }}")
-
     - name: Run Buildx (master)
       if: success() && contains(steps.prepare.outputs.version, 'master')
       run: |
@@ -132,3 +140,12 @@ jobs:
       if: success() && !contains(steps.prepare.outputs.version, 'master')
       run: |
         ${{ steps.login.outputs.buildx }} --file Dockerfile .
+    - name: Push to GitHub Packages
+      if: success() && contains(steps.prepare.outputs.version, 'master')
+      uses: docker/build-push-action@v1
+      with:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        registry: docker.pkg.github.com
+        repository: sickchill/sickchill/sickchill
+        tag_with_ref: true

@@ -53,6 +53,7 @@ import bencode
 import certifi
 import cfscrape
 import cloudscraper
+import ifaddr
 import rarfile
 import requests
 import six
@@ -241,6 +242,10 @@ def is_media_file(filename):
 
         # ignore RARBG release intro
         if re.search(r'^RARBG\.(\w+\.)?(mp4|avi|txt)$', filename, re.I):
+            return False
+
+        # ignore Kodi tvshow trailers
+        if filename == 'tvshow-trailer.mp4':
             return False
 
         # ignore MAC OS's retarded "resource fork" files
@@ -802,6 +807,7 @@ def create_https_certificates(ssl_cert, ssl_key):
         from OpenSSL import crypto
         from certgen import createKeyPair, createCertRequest, createCertificate, TYPE_RSA
     except Exception:
+        logger.log(traceback.format_exc())
         logger.log(_("pyopenssl module missing, please install for https access"), logger.WARNING)
         return False
 
@@ -821,14 +827,16 @@ def create_https_certificates(ssl_cert, ssl_key):
     # Save the key and certificate to disk
     # noinspection PyBroadException
     try:
-
         # Module has no member
         io.open(ssl_key, 'wb').write(crypto.dump_privatekey(crypto.FILETYPE_PEM, pkey))
         io.open(ssl_cert, 'wb').write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
-    except Exception:
-        logger.log(_("Error creating SSL key and certificate"), logger.ERROR)
+    except Exception as error:
+        logger.log(traceback.format_exc())
+        logger.log(_("Error creating SSL key and certificate {error}").format(error.message), logger.WARNING)
         return False
 
+    logger.log(_('Created https key: {ssl_key}').format(ssl_key=ssl_key))
+    logger.log(_('Created https cert: {ssl_cert}').format(ssl_cert=ssl_cert))
     return True
 
 
@@ -1734,8 +1742,21 @@ def tvdbid_from_remote_id(indexer_id, indexer):  # pylint:disable=too-many-retur
         return tvdb_id
 
 
-def is_ip_private(ip):
-    return ipaddress.ip_address(ip.decode()).is_private
+def is_ip_local(ip):
+    request_ip = ipaddress.ip_address(ip.decode())
+    if request_ip.is_private:
+        return True
+
+    for adapter in ifaddr.get_adapters():
+        for aip in adapter.ips:
+            if isinstance(aip.ip, tuple):
+                network = ipaddress.IPv6Network("%s/%s" % (aip.ip[0], aip.network_prefix), strict=False)
+            else:
+                network = ipaddress.IPv4Network("%s/%s" % (aip.ip, aip.network_prefix), strict=False)
+
+            if request_ip in network:
+                return True
+    return False
 
 
 def recursive_listdir(path):
@@ -1822,3 +1843,11 @@ def bdecode(x, allow_extra_data=False):
     if not allow_extra_data and l != len(x):
         raise bencode.BTL.BTFailure("invalid bencoded value (data after valid prefix)")
     return r
+
+
+def is_docker():
+    path = '/proc/self/cgroup'
+    return (
+        os.path.exists('/.dockerenv') or
+        os.path.isfile(path) and any('docker' in line for line in open(path))
+    )
